@@ -1,0 +1,4 @@
+2665901 @ fix: 打通 STM32F103RC 驱动 + ISR（修复 Lockup）
+f08ed3d @ feat: SRAM heartbeat for MCU liveness verification
+2541566 @ feat: LED blink on PB0 via direct register access
+a3a908f @ chore: initial project scaffold — Zig + C mixed compilation for STM32F103RC
