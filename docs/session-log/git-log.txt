@@ -2,3 +2,10 @@
 f08ed3d @ feat: SRAM heartbeat for MCU liveness verification
 2541566 @ feat: LED blink on PB0 via direct register access
 a3a908f @ chore: initial project scaffold — Zig + C mixed compilation for STM32F103RC
+
+=== 离岸 git 分支（2026-07-06 evening）===
+main:    edcc27c merge dev → main: 打通 STM32F103RC 驱动 + ISR（--no-ff, 里程碑可见性）
+release: (deleted, 非正式版本不走 release)
+dev:     2665901 @ fix: 打通 STM32F103RC 驱动 + ISR（线性开发）
+2cee2e4 merge: docs/session-log into dev (--no-ff for traceability)
+e477a0d @ docs: add session log for 2026-07-06 design-report context (docs/session-log 分支)
