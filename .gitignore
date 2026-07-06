@@ -1,0 +1,12 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Keil uVision build artifacts
+Objects/
+Listings/
+DebugConfig/
+*.uvguix.*
+
+# IDE
+.vscode/
