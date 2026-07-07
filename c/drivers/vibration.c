@@ -19,6 +19,13 @@ static volatile uint8_t  s_pending        = 0;
 static volatile uint32_t s_trigger_ms     = 0;
 
 void vibration_init(void) {
+    /* 0) Phase D —— PC3 内部上拉 (CNF=10 input-pull, MODE=00, ODR=1 选上拉)
+     *    CRL[15:12] = PC3 字段。4-bit 编码 = CNF[3:2] | MODE[1:0] = 0b1000 = 0x8
+     *    没有这一步,板上无外部上拉时 EXTI3 永远浮空,无法靠杜邦线模拟触发 */
+    VIBE_GPIO_CLK_EN();   /* 复用 board.h 宏:使能 GPIOC + AFIO 时钟 */
+    GPIOC->CRL = (GPIOC->CRL & ~(0xFu << 12)) | (0x8u << 12);
+    GPIOC->ODR |= (1u << 3);   /* ODR bit3=1 → pull-up (vs ODR=0 时 pull-down) */
+
     /* 1) AFIO: EXTI3 输入源 = PCx → EXTI3[3:0] = 0b0010 (AFIO_EXTICR1, bits 12..15) */
     AFIO->EXTICR[0] = (AFIO->EXTICR[0] & ~(0xFu << 12))
                      |  (0x2u << 12);

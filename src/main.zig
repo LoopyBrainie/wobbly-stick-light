@@ -1,17 +1,19 @@
-//! Firmware entry point —— Phase 0 最小化诊断版本
+//! Firmware entry point —— Phase 0 heartbeat
 //!
-//! 仅做：1) PB0 设推挽 50MHz 输出；2) 调 board_init()；3) 死循环翻转 PB0
-//! 不调 led_pov_init / vibration_init（这些之后再加）
-//! 目的：判断 Lockup 发生在 board_init 之前还是之后
+//! 5-Phase 底层验证已全部 PASS(详见 c/tests/ 与 docs/)。生产路径只保留:
+//!   - PB0 LED 心跳(visor 反馈)
+//!   - 板级 clock + SysTick 由 board_init() 配好
+//!   - TIM7 ISR (250us) 由 led_pov.c 接好,刷新 POV 字模
+//!   - EXTI3 (PC3) 由 vibration.c 接好,触发 POV 复位
 
 const std = @import("std");
 
 // ── C 函数声明 ──
 extern fn board_init() callconv(.c) void;
+extern fn led_pov_init() callconv(.c) void;
 
-// ── 调试可见的全局变量（写在 0x20000000 附近，halt 后 probe-rs 可读） ──
-export var phase: u32 = 0xAAAAAAAA;
-export var phase2: u32 = 0xBBBBBBBB;
+// ── probe-rs 可见的全局 (.data 起始,life-of-flash 给 debug 用) ──
+export var phase: u32 = 0xA5A5A5A5;
 
 // ── PB0 LED ──
 const RCC_BASE    = 0x40021000;
@@ -23,42 +25,28 @@ const RCC_APB2ENR_IOPBEN = 1 << 3;
 const LED_PIN = 0;
 
 export fn main() callconv(.c) noreturn {
-    phase = 0x11111111;  // 进入 main 标记
-
-    // PB0 init
+    // PB0 init: 推挽 50MHz 输出 (heartbeat 信号)
     RCC_APB2ENR.* |= RCC_APB2ENR_IOPBEN;
     _ = RCC_APB2ENR.*;
     GPIOB_CRL.* &= ~@as(u32, 0xF << (LED_PIN * 4));
     GPIOB_CRL.* |= 0x3 << (LED_PIN * 4);
+    GPIOB_BSRR.* = @as(u32, 1) << LED_PIN;   // LED on = "boot 完成"
 
-    phase = 0x22222222;  // PB0 OK，准备调 board_init
-
-    // 调 C 板级初始化（HAL 等价序列）
     board_init();
+    led_pov_init();   // 配 SPI1 + TIM7 + NVIC
 
-    phase = 0x33333333;  // board_init 返回
+    phase = 0x16161616;   // 进入 halted 状态
 
-    // 死循环翻 PB0
-    // 注意：-Os 下空 while 循环会被优化掉，必须在循环体里读 volatile 寄存器
-    //      作副作用锚点。这里读 SysTick->VAL（72 MHz SysTick，每 ms 倒数一次）
-    const SysTick_VAL = @as(*volatile u32, @ptrFromInt(0xE000E018));
+    // Halt: TIM7 ISR (250us) 持续翻 PB0,EXTI3 ISR 准备响应振动。
+    // asm volatile nop 作副作用锚点 —— 不被 -Os 优化掉 (符合 CLAUDE.md)。
     while (true) {
-        GPIOB_BSRR.* = @as(u32, 1) << LED_PIN;       // set PB0=1
-        // 约 250ms 延迟：读 SysTick VAL 72000 次 × 一次循环 4 instr ≈ 4 ms... 改用 200 万次
-        var i: u32 = 0;
-        while (i < 2000000) : (i += 1) {
-            _ = SysTick_VAL.*;  // 防优化
-        }
-        GPIOB_BSRR.* = @as(u32, 1) << (LED_PIN + 16); // reset PB0=0
-        var j: u32 = 0;
-        while (j < 2000000) : (j += 1) {
-            _ = SysTick_VAL.*;  // 防优化
-        }
+        asm volatile ("nop");
     }
 }
 
-pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {
-    phase = 0xDEADBEEF;  // panic 标记
-    _ = msg;
-    while (true) {}
+pub fn panic(_: []const u8, _: ?*std.builtin.StackTrace, _: ?*usize) noreturn {
+    phase = 0xDEADBEEF;
+    while (true) {
+        asm volatile ("nop");
+    }
 }

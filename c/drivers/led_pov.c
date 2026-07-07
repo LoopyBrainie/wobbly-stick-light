@@ -49,6 +49,21 @@ void led_pov_init(void) {
     RCC->APB2RSTR |= RCC_APB2RSTR_SPI1RST;
     RCC->APB2RSTR &= ~RCC_APB2RSTR_SPI1RST;
 
+    /* 1a) Phase A —— GPIOA->CRL pin mux，让 SPI1 真正驱动 PA5/PA7
+     *      本项目 SPI1 引脚映射（board.h:52-59，非标准 SPI1 全双工）：
+     *        PA5 = SCK  → AF push-pull  0xB
+     *        PA6 = CS   → GP push-pull  0x3 ← 软件片选，不是 MISO
+     *        PA7 = MOSI → AF push-pull  0xB
+     *        PA4 = 备用 → GP push-pull  0x3
+     *      GPIOA->CRL[31:16] 每 4 bit 字段编码：(CNF[3:2] | MODE[1:0])
+     */
+    GPIOA->CRL = (GPIOA->CRL & ~0xFFFF0000u)
+               | (0x3u << 16)   /* PA4 — GP push-pull 50MHz                  */
+               | (0xBu << 20)   /* PA5 — SCK, AF push-pull 50MHz              */
+               | (0x3u << 24)   /* PA6 — CS, GP push-pull 50MHz               */
+               | (0xBu << 28);  /* PA7 — MOSI, AF push-pull 50MHz             */
+    POV_CS_PORT->BSRR = POV_CS_PIN;   /* CS idle high */
+
     /* 2) SPI1 CR1：主模式、软件 NSS、BR=001 (APB2/4 = 18 MHz)、MSB 先、空闲低、第 1 边沿采样 */
     SPI1->CR1 = SPI_CR1_MSTR | SPI_CR1_SSI | SPI_CR1_SSM |
                 (0x1u << SPI_CR1_BR_Pos);

@@ -12,3 +12,6 @@ DebugConfig/
 .vscode/
 
 car2025_final
+
+# --- 测试/调试期临时工具 (与 Keil 的 Objects/Listings 风格一致) ---
+tools/

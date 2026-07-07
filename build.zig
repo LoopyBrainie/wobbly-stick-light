@@ -48,6 +48,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addCSourceFile(.{ .file = b.path("c/drivers/led_pov.c"),      .flags = cflags });
     exe.root_module.addCSourceFile(.{ .file = b.path("c/drivers/vibration.c"),    .flags = cflags });
     exe.root_module.addCSourceFile(.{ .file = b.path("c/drivers/font_pov.c"),     .flags = cflags });
+    // 注: Phase B/C 验证用测试代码 (test_spi.c / test_tim7.c) 已移至 c/tests/,
+    //     不参与 production build。未来若要重现 5 Phase 验证,把这两行重新加回来 + 把 tests/ 加到 include path。
 
     // ── Linker script ──
     exe.setLinkerScript(b.path("c/ld/stm32f103rct6.ld"));

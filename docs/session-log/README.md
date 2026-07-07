@@ -370,3 +370,275 @@ git checkout dev
 - "空循环延时是反模式"——必须 SysTick/TIMx
 - "临时 debug 也应该使用 asm volatile(\"nop\")，不要用 _ = SysTick_VAL.* 模糊意图"
 - "这不是正式发布版本，仅作开发过程中的稳定里程碑且具备重要意义，需在 main 上合并一次提高可见性"——离岸策略的灵活运用
+
+---
+
+## 12. Session 3（2026-07-07 morning）：POV 5 Phase 底层验证全通过
+
+> 本节记录在 dev 分支上完成的"POV 推帧链路 5 个底层路径验证"。session-log 之所以重要：每个 Phase 的引脚 mux、wire 接线、ISR 行为都不能从代码还原，必须留文字。
+
+### 12.1 5 Phase 全景
+
+| Phase | 验证目标 | 关键路径 | 验证手段 | 最终结论 |
+|-------|---------|----------|----------|---------|
+| A | SPI1 PA5/PA6/PA7 pin mux | led_pov_init() 写 GPIOA->CRL | probe-rs read b32 0x40010800 | 0xB3B34444 |
+| B1 | Blocking SPI loopback | test_spi_loopback_blocking() | read b32 0x20000030 | rx=[0x55,0xAA,0xF0] |
+| B2 | DMA1 ch3+ch2 SPI loopback | test_spi_loopback_dma() | 同上 | rx+done=1 |
+| C | TIM7 100µs + LED toggle | test_tim7_start() | 视觉 + read 0x20000014 | LED 半亮 + 计数 120k |
+| D | EXTI3 PC3 上升沿 ISR | vibration_init() | read 0x20000018 | 计数 0→4→9 |
+
+### 12.2 项目非标准 SPI1 引脚映射（关键陷阱，设计报告必引）
+
+c/drivers/board.h:52-59 定义的引脚，不是 STM32 标准 SPI1 全双工：
+
+- PA4 = NSS/CS（未用，配置防浮空）
+- PA5 = SCK → AF push-pull 50MHz
+- PA6 = 手动 CS（BSRR bit-bang）→ GP push-pull 50MHz，不复用 MISO
+- PA7 = MOSI → AF push-pull 50MHz
+
+LED 驱动是单向写入（SPI 主 → 从），无回传路径，因此不需要配 MISO。后果：led_pov_init() 内 CRL 写只需配 PA5（SCK）+ PA6（CS GP PP）+ PA7（MOSI）。SRAM 无 buffer 接收回读。
+
+### 12.3 真 bug 修复 1：Phase A pin mux
+
+症状：led_pov_init() 配置了 SPI1 CR1（master, BR, SSI/SSM, SPE），从未配置 GPIOA->CRL。PA5/PA6/PA7 留复位态 = floating input，SPI1 peripheral 即使 SPE=1 也不会驱动引脚（STM32F1 文档：peripheral 输出需 GPIO AF PP mode）。
+
+修复：步骤 1a 插在 SPI 复位后、CR1 配置前：
+
+```
+GPIOA->CRL = (GPIOA->CRL & ~0xFFFF0000u)
+           | (0x3u << 16)   /* PA4 — GP PP 50MHz (unused)             */
+           | (0xBu << 20)   /* PA5 — SCK, AF PP 50MHz                */
+           | (0x3u << 24)   /* PA6 — CS, GP PP 50MHz (project-specific) */
+           | (0xBu << 28);  /* PA7 — MOSI, AF PP 50MHz              */
+POV_CS_PORT->BSRR = POV_CS_PIN;   /* CS idle high */
+```
+
+位序陷阱（用户当场指出，代码审查关键时刻）：CRL 高 16 bit 内部排列为 PA7 在最高 nibble，PA4 在最低 nibble。最初我按"PA4→PA7 顺次拼接"写 0xBBB3，错了。正确读法：bit 31-28 = PA7 = 0xB；bit 27-24 = PA6 = 0x3；bit 23-20 = PA5 = 0xB；bit 19-16 = PA4 = 0x3；拼接 = 0xB3B3。
+
+### 12.4 真 bug 修复 2：Phase D PC3 内部上拉
+
+问题：vibration_init() 配 AFIO_EXTICR + RTSR + IMR + NVIC，但没配 PC3 输入上拉。板上无外部上拉电阻时 PC3 浮空，杜邦线无法稳定触发 EXTI3。
+
+修复：步骤 0 插在 AFIO EXTICR 前：
+
+```
+VIBE_GPIO_CLK_EN();
+GPIOC->CRL = (GPIOC->CRL & ~(0xFu << 12)) | (0x8u << 12);   /* CNF=10 input-pull, MODE=00 */
+GPIOC->ODR |= (1u << 3);                                     /* ODR=1 → 上拉（ODR=0 是下拉）*/
+```
+
+### 12.5 Phase C pin 换 PA8 → PB0（蜂鸣器问题）
+
+用户反馈："烧录后听到蜂鸣器"。
+
+根因：STM32F103 默认 PA8 复用为 TIM1_CH1。car2025_final/Core/Src/music.c 就是用 TIM1_CH1 出蜂鸣器 PWM。board_init.c:POV_CS 注释也确认 "PA6 复用原 IR_LOCK" 暗示板上很多管脚有内部重新走线。直接 GPIO 翻转 PA8 会让蜂鸣器发声，即使没启用 TIM1。
+
+解决方案：改翻 PB0（LED，已知非 BEEP）。改动：GPIOA->BSRR ^= (1<<8) → GPIOB->BSRR ^= (1<<0)。同时不动 PA8 GPIO 配置，让 PA8 保留复位态输入（降低无意驱动蜂鸣器概率）。
+
+为什么选 PB0：板上接 LED（原 Phase 0 验证过），不接蜂鸣器；5 kHz 翻转 LED 肉眼呈现"半亮"（占空比 50% 积分），同时作视觉验证；不需要新加 GPIO 配置（main.zig 已配）。
+
+### 12.6 Phase D 物理操作规范（未来回归测试参考）
+
+接线：杜邦线一端 Pin 6（PC3/VIBE_SIG），另一端 Pin 2（GND）。Pin 7（TIM7_TICK）是内部资源，board.h:18 注释"不出到接口"，物理上不存在。
+
+正确序列：
+
+1. 杜邦线悬空，不碰任何金属 ← g_isr_count_exti3 基线读 = X（典型 0）
+2. 碰 Pin 2（GND）~100ms ← 短接 = 下降沿，EXTI3 不响应
+3. 松开 ← 释放 = 内部上拉拉回高 = 上升沿，EXTI3 触发 ISR
+4. 等 ~300ms（过 5ms 软消抖）
+5. 再读 g_isr_count_exti3 ← 期望 >= X + 1
+
+为什么是"松开"才是关键：EXTI3 配置 RTSR=1, FTSR=0，只响应上升沿。短接 = 下降沿（无反应）；松开 = 上升沿（触发）。
+
+机械弹跳现象（实测）：用户单次碰-松操作，g_isr_count_exti3 从 0 跳到 4（不是 1）。STM32 内置 Schmitt trigger 在金属触点接触电阻跳变时多次解释为独立边沿。这是真实硬件的常态，不是 bug。5ms 软消抖（vibration_consume()）会把 raw N 个 ISR 合并成 ~1 个有效振动事件。
+
+### 12.7 probe-rs 0.31 CMSIS-DAP multi-transfer bug + 工作流切换
+
+症状：probe-rs read --chip STM32F103RC b32 <addr> <count> 在某些场景报 "Failed to read component information at 0xe0001000"（自动探测芯片失败）以及 "CMSIS_DAP: Only 1/2 transfers were executed, but no error was reported"。
+
+根因：BUPT CMSIS-DAP v2025 探测器固件对 DAP multi-transfer 命令支持不全。probe-rs read 自动探测阶段读 ROM table 用了 multi-transfer。
+
+解决方案：
+
+1. 加 --chip STM32F103RC 跳过自动探测（必须）
+2. 单次 read 用 probe-rs CLI（可行，用于 peripheral 寄存器如 0x40010800）
+3. 改用 gdb 链路：probe-rs gdb --chip STM32F103RC + arm-none-eabi-gdb + target remote localhost:1337 + gdb remote protocol 走单 transfer per memory read
+
+gdb 限制：probe-rs gdbserver 默认内存 map 不含 peripheral 区域（0x40000000-0x5FFFFFFF）。gdb x/wx 0x40010800 报 "Cannot access memory"。peripheral 寄存器必须走 probe-rs CLI 或加 firmware 端 debug mirror。
+
+### 12.8 关键 SRAM 地址实测（probe-rs / gdb 可读）
+
+| 变量 | 地址 | 含义 | 期望值（Phase 全过） |
+|------|------|------|---------------------|
+| phase（Zig） | 0x20000000 | main 进度 | 0x16161616 |
+| g_systick_ms | 0x2000000C | SysTick 1ms tick | 持续涨 |
+| g_isr_count_tim7 | 0x20000014 | TIM7 ISR 命中 | 跑 5 秒涨 ~50000 |
+| g_isr_count_exti3 | 0x20000018 | EXTI3 ISR 命中 | 操作前后增 ≥ 1 |
+| s_state | 0x2000001C | led_pov 状态机 | 0x1 |
+| s_cat | 0x20000020 | POV cat 索引 | 0 |
+| s_pending | 0x20000028 | 振动事件消抖后标志 | 0 |
+| s_trigger_ms | 0x2000002C | 最近触发时间戳 | 0 |
+| g_spi_test_phase | 0x20000030 | B1 步骤 | 0x3 |
+| g_spi_test_rx[0..2] | 0x20000034 | B1 接收字节 | 0x55, 0xAA, 0xF0 |
+| g_spi_dma_rx[0..2] | 0x20000037 | B2 接收字节 | 0x55, 0xAA, 0xF0 |
+| g_spi_dma_done | 0x2000003C | B2 完成标志 | 0x1 |
+| GPIOA->CRL | 0x40010800 | pin mux 寄存器 | 0xB3B34444 |
+| TIM7->CR1 | 0x40001400 | TIM7 控制 | 0x1（CEN） |
+
+g_spi_test_tx 在 .data（初始化值 0x55 0xAA 0xF0），地址 0x20000004。g_spi_test_rx / g_spi_dma_rx / g_spi_dma_done 都在 .bss。
+
+### 12.9 验证夹具临时代码 → c/tests/
+
+新增文件：
+
+- c/drivers/test_spi.c — Phase B1（blocking）+ Phase B2（DMA）+ DMA1_Channel2_IRQHandler 强符号
+- c/drivers/test_tim7.c — Phase C：TIM7_IRQHandler 强符号覆盖 it.c 的 weak 版本 + test_tim7_start()
+
+关键设计（用户选的 Option 1，临时回退 PA6 为 MISO）：PA6 在 B 测试期间临时回退到 0x4 floating input，跑完恢复到 0x3 GP push-pull。所有临时反转逻辑全在 test_spi.c，led_pov.c 生产代码保持纯净。
+
+用户选择"改名而不是删除"（收尾）：
+
+- c/drivers/test_spi.c → c/tests/test_spi.c
+- c/drivers/test_tim7.c → c/tests/test_tim7.c
+- build.zig 删 2 行 addCSourceFiles
+- it.c 移除 __attribute__((weak))
+- main.zig 简化回 Phase 0（PB0 LED + board_init + led_pov_init + halt）
+- 生产 ELF：724516 → 719732 bytes（节省 4784）
+
+未来重现 5 Phase 验证：把 c/tests/ 下两个文件加回 build.zig 的 addCSourceFiles，把 tests/ 加到 include path，改 main.zig 加调用，5 分钟重跑。
+
+### 12.10 volatile 真轮询 vs 优化屏障辨析（设计报告可引）
+
+CLAUDE.md 铁律禁的是"为防优化而读 volatile 寄存器但不读其值"：
+
+```
+// 错：空循环优化屏障 — 模糊意图，被禁
+while (SysTick_VAL.* != 0) {}   // 读 volatile 但不用其值
+```
+
+允许的真轮询（本项目 Phase B1 验证用）：
+
+```
+uint32_t t0 = g_systick_ms;
+while ((g_systick_ms - t0) < 1U) { /* 读 volatile，实际作了 < 比较，合法 */ }
+```
+
+读 volatile 的值参与条件判断，真在轮询 ISR 改写的计数器。意图清晰（等 1ms），portable。同样，Phase B2 的 while (g_spi_dma_done == 0) 是合法真轮询：DMA ISR 改写 volatile，gdb 提示时它的值用于 == 0 条件判断。
+
+### 12.11 DMA1 中断命名坑（设计报告可引）
+
+CMSIS 命名：STM32F103 DMA channel 控制寄存器位名是 DMA_CCR_EN / DMA_CCR_TCIE / DMA_CCR_DIR / DMA_CCR_MINC（不带 channel 后缀）。最初错误写 DMA_CCR1_EN（猜测的"channel 1"风格命名），编译报 undeclared identifier，纠正。
+
+正确 ISR 命名：DMA1_Channel2_IRQHandler（有 channel 后缀，IRQn 12）。这个在 startup.s 里有 weak 默认 handler，test_spi.c 提供强符号覆盖。链接器对 IRQn vector 名是按 channel 后缀的。
+
+### 12.12 用户反馈语录（本 session，设计报告引用）
+
+- "和 HAL 对偶"——行为等价于 HAL 但不依赖 HAL 抽象层，可从 HAL 代码提取正确的初始化序列与寄存器值用裸寄存器重写
+- "我必须用 gdb 这样总是 read fail 根本没法正常调试"——probe-rs CMSIS-DAP bug 出现后，稳定路径是 gdb
+- "我觉得有可能是因为我未能理解短接 6、7 的作用导致误解"——主动指出对 Phase D 协议的初始误解
+- "现在回到实验验证流程"——结束 gdb 探索，回到 gdb 链路
+- "C:两条都做（B 重测 + D）"——选择最严谨的收尾路径
+- "可能计数器没有严格按照预期"——对 Phase D g_isr_count_exti3 计数 > 1 表示不解（实为机械弹跳，这是硬件常态）
+- "改名而不是删除"——收尾清理选 Option 3
+- "总结本次对话在未来可能会对完成设计报告有帮助的内容"——本次 session 的元任务
+
+### 12.13 设计报告相关 - 5 Phase 验证的"闭环证据链"
+
+直接证明：每次 Phase 通过有至少 1 个不可由其他 Phase 推出的硬件寄存器观测。
+
+关键洞察：Phase B 的字节精确匹配（tx = rx = 0x55, 0xAA, 0xF0）是 Phase A 的强间接证据。如果 PA5/PA7 pin mux 失败，SPI 输出无法到物理线，slave（PA6 测试 MISO）无法收到字节匹配。
+
+### 12.14 项目产出（可继续 git commit）
+
+未提交改动清单（dev 分支）：
+
+1. c/drivers/led_pov.c — 新增 led_pov_init() 步骤 1a（Phase A pin mux）
+2. c/drivers/vibration.c — 新增 vibration_init() 步骤 0（PC3 上拉）
+3. c/tests/test_spi.c — Phase B 验证夹具（从 c/drivers/ 移出）
+4. c/tests/test_tim7.c — Phase C 验证夹具（从 c/drivers/ 移出）
+5. build.zig — 注释掉 test_*.c addCSourceFiles，留下回归路径说明
+6. src/main.zig — 简化成 Phase 0 heartbeat
+
+建议 commit 拆分：
+
+- @ fix: SPI1 pin mux + PC3 pull-up — 提交 1 + 2（真 bug 修复）
+- @ refactor: 5 Phase 验证夹具移到 c/tests/，移除 it.c weak — 提交 3 + 4 + 5 + 6
+- （可选）@ docs: session-log 记录 5 Phase 验证 — 提交本 README 第 12 节
+
+### 12.15 用户后续可以问的方向
+
+- POV 应用层逻辑实现（从 car2025_final/Core/Src/led_show.c 移植 LEDSHOW()）
+- 字模注入（firmware 端提供 PC 工具链把图像转 .h 数组）
+- main loop 状态机（读取振动 → 触发 s_pending → 调 led_pov_on_vibration → 调 led_pov_start）
+- USART1 + RTT 调试输出（取代 halt + probe-rs read 工作流）
+
+---
+
+## 13. Session 3 补充：GDB Workflow 实测命令集（可复用片段）
+
+### 13.1 probe-rs gdbserver + arm-none-eabi-gdb 完整流程
+
+Terminal A（前台挂着 gdbserver）：
+
+```
+probe-rs gdb --chip STM32F103RC zig-out\bin\wobbly-stick-light
+```
+
+期望输出：INFO probe_rs::gdb_server: Listening on 0.0.0.0:1337
+
+Terminal B（gdb client）：
+
+```
+arm-none-eabi-gdb zig-out\bin\wobbly-stick-light
+```
+
+gdb 内命令：
+
+- target remote localhost:1337（连 gdbserver，默认端口 1337）
+- monitor reset halt（chip 拉回 reset_vector）
+- load（重刷 ELF）
+- continue（全速跑）
+
+firmware halt 后典型读：
+
+- print/x g_spi_test_phase（符号级读，绕开对齐问题）
+- print g_spi_test_rx[0..2]（单字节读）
+- print g_isr_count_tim7（TIM7 ISR 计数）
+- print g_isr_count_exti3（EXTI3 ISR 计数）
+- print s_state（led_pov 状态机）
+- x/4bx 0x20000020（.bss 区域原始字节，检查是否被 zero）
+- x/wx 0x2000001c（s_state as 32-bit word）
+
+Symbol-based reads vs address-based reads：
+
+- 符号读（print g_spi_test_rx[0]）→ 通过编译时表解 → 绕开任何对齐/偏移错
+- 地址读（x/wx 0x20000034）→ 直接打地址 → 要自己保证 4 字节对齐（例如 0x20000037 不对齐会报 not aligned to 4 bytes）
+
+### 13.2 替代：GDB 启动后卡在 Phase A/B 时的常见命令
+
+- info registers pc
+- x/i $pc（反汇编当前 PC）
+- disassemble led_pov_init（验证 led_pov_init 的 CRL 写没被优化掉）
+- print/x *(unsigned int*)0x40001400（TIM7->CR1，期望 0x1）
+- print/x *(unsigned int*)0x40010400（AFIO_EXTICR1，期望 0x00002000 = PC3 → EXTI3）
+- print/x *(unsigned int*)0x40010414（EXTI_RTSR，期望 bit3=1）
+
+调试技巧：利用 phase 变量作 checkpoint。在 main.zig 各 phase 入口写 phase = 0xNNNNNNNN。halt 后 read 0x20000000 看跑到哪。
+
+### 13.3 probe-rs + gdb 常见故障速查
+
+| 现象 | 原因 | 解 |
+|------|------|-----|
+| probe-rs read 报 Only 1/2 transfers executed | BUPT CMSIS-DAP multi-transfer bug | 加 --chip STM32F103RC，或换 gdb |
+| gdb x/wx 0x40010800 报 Cannot access memory | probe-rs gdbserver 默认不含 peripheral 区 | 改 probe-rs CLI 读，或加 firmware debug mirror |
+| gdb x/wx 0x20000037 报 not aligned to 4 bytes | 地址未 4 字节对齐 | 改读 0x20000034 或 0x20000038，或用符号读 |
+| target remote localhost:1337 报 Connection refused | probe-rs gdbserver 没起 | netstat -ano \| findstr :1337 看 PID |
+| arm-none-eabi-gdb 命令找不到 | 不在 PATH | 用户 env 已有，which arm-none-eabi-gdb 确认 |
+
+### 13.4 VS Code + Cortex-Debug（备用，本 session 未走通）
+
+如果用户改用 VS Code 替代纯 gdb：装 marus25.cortex-debug，配置 .vscode/launch.json 用 servertype: probe-rs-debug，F5 启动，Watch 窗口加 0x40010800 看 GPIOA CRL。
+
+---
+
