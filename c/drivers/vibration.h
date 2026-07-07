@@ -61,9 +61,26 @@ void vibration_exti_isr(void);
  *
  * == 副作用 ==
  *   - 消费成功后清 pending
- *   - 同时调用 led_pov_on_vibration() 完成过零复位
+ *   - 调用方随后触发 led_pov fence（g_LED_key_down）完成过零复位
+ *   - 本函数本身不直接调用 led_pov_on_vibration()，副作用全在 fence 侧
  */
 uint8_t vibration_consume(void);
+
+/**
+ * @brief  fence 协议专用消费：无消抖窗口，仅清 pending
+ * @retval 1   pending 被清
+ * @retval 0   本来就无 pending
+ *
+ * == 使用场景 ==
+ *   上层在通过 vibration_consume() 拿到过一次有效触发后，
+ *   后续每一次 TIM7 tick 边界前用本函数把新到的 EXTI3 信号
+ *   转换成对 led_pov.c 中 g_LED_key_down 的 1 次置位；
+ *   led_pov tick() 会异步执行 col/cat 归零。
+ *
+ * == 副作用 ==
+ *   - 仅清 s_pending，不调用任何 LED 接口
+ */
+uint8_t vibration_consume_clear(void);
 
 /**
  * @brief  获取自上次触发以来的毫秒数（用于调试 / 高级逻辑）
