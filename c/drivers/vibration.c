@@ -64,6 +64,16 @@ uint8_t vibration_consume(void) {
     return 1;
 }
 
+/* 无消抖消费：仅用于 fence 协议，调用方已通过振动 consume 走完 5 ms 窗口
+ * 此函数只清 pending，不调用任何 LED 接口 —— 副作用由 led_pov tick
+ * 检测 g_LED_key_down 完成
+ */
+uint8_t vibration_consume_clear(void) {
+    if (s_pending == 0) return 0;
+    s_pending = 0;
+    return 1;
+}
+
 uint32_t vibration_last_tick_ms(void) {
     return s_trigger_ms;
 }

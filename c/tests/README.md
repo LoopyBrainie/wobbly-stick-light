@@ -450,24 +450,75 @@ probe-rs read --chip STM32F103RC b32 0x40020030 1   # DMA1 ch3 CCR
 - **gdb 对齐报错**:`x/wx 0x20000037` 报 "not aligned to 4 bytes"。
   改读 `0x20000034`,或用符号读 (`print g_spi_dma_rx[0]`)。
 
-### 4.4 已知 SRAM 地址表(本次实测)
+### 4.4 已知 SRAM 地址表(LOOP 4 实测 — 2026-07-07)
+
+> **LOOP 4 变更**:
+> 1. `c/drivers/led_pov.c` `s_font` 默认初始化由 NULL 改为 `FONT_LKM`,
+>    把 `s_font` 从 .bss 移到 .data，并保证 FONT_LKM 不被 LTO GC。
+> 2. `c/drivers/font_pov.c` FONT_LKM/FONT_RAINBOW/FONT_ALL_RED 各 120 B
+>    实字模数据填入（见 § 4.5）。
+> 3. 整体 .data + .bss 段因 s_font 占据 4 B、g_LED_Show_RAM 占 24 B、
+>    g_LED_key_down/s_col 各 1 B 而后移；原 .data/bss 测试符号
+>    `g_spi_test_tx/g_spi_test_phase/g_spi_test_rx/g_spi_dma_rx/g_spi_dma_done`
+>    已随 c/tests/ 移出 production build 而消失。
+> 详细漂移见"LOOP 1 → LOOP 4 漂移表"。
 
 | 变量 | 类型 | 地址 | 大小 | 验证 Phase |
 |------|------|------|------|------------|
-| `phase` (Zig) | .data | `0x20000000` | 4 | 通用 |
-| `g_spi_test_tx[3]` | .data | `0x20000004` | 3 | B1/B2 |
-| `g_systick_ms` | .bss | `0x2000000C` | 4 | 系统存活 |
-| `g_isr_count_systick` | .bss | (同区) | 4 | 系统存活 |
-| `g_isr_count_tim7` | .bss | `0x20000014` | 4 | C |
-| `g_isr_count_exti3` | .bss | `0x20000018` | 4 | D |
-| `s_state` | .bss | `0x2000001C` | 4 | led_pov 状态机 |
-| `s_cat` | .bss | `0x20000020` | 4 | led_pov cat 索引 |
-| `s_pending` | .bss | `0x20000028` | 4 | 振动事件标志 |
-| `s_trigger_ms` | .bss | `0x2000002C` | 4 | 最近触发时间戳 |
-| `g_spi_test_phase` | .bss | `0x20000030` | 4 | B1 |
-| `g_spi_test_rx[3]` | .bss | `0x20000034` | 3 | B1 |
-| `g_spi_dma_rx[3]` | .bss | `0x20000037` | 3 | B2 |
-| `g_spi_dma_done` | .bss | `0x2000003C` | 4 | B2 |
+| `SystemCoreClock` | .data | `0x20000000` | 4 | 系统时钟（HAL） |
+| `s_font` (=FONT_LKM) | .data | `0x20000004` | 4 | 默认字模指针 |
+| `g_systick_ms` | .bss | `0x20000008` | 4 | 系统存活 |
+| `g_isr_count_systick` | .bss | `0x2000000C` | 4 | 系统存活 |
+| `g_isr_count_tim7` | .bss | `0x20000010` | 4 | C |
+| `g_isr_count_exti3` | .bss | `0x20000014` | 4 | D |
+| `g_LED_key_down` | .bss | `0x20000018` | 1 | 过零围栏标志（LOOP 3） |
+| `g_LED_Show_RAM[24]` | .bss | `0x20000019` | 24 | led_pov 帧缓冲（LOOP 2） |
+| `s_state` | .bss | `0x20000034` | 4 | led_pov 状态机 |
+| `s_cat` | .bss | `0x20000038` | 1 | led_pov cat 索引 |
+| `s_col` | .bss | `0x20000039` | 1 | led_pov 列索引（LOOP 3） |
+| `s_pending` | .bss | `0x2000003C` | 4 | 振动事件标志 |
+| `s_trigger_ms` | .bss | `0x20000040` | 4 | 最近触发时间戳 |
+
+#### 字模常量在 Flash 的地址（LOOP 4 新可见 — 因 s_font 引用 FONT_LKM 而保住）
+
+| 符号 | 地址 | 大小 | 备注 |
+|------|------|------|------|
+| `FONT_LKM`    | `0x0800093B` | 120 (0x78) | L=蓝 K=绿 M=红 |
+| `FONT_RAINBOW`| `0x080009B3` | 120 (0x78) | 蓝→绿→红横向渐变 |
+| `FONT_ALL_RED`| `0x08000A2B` | 120 (0x78) | 纯红填充（颜色校准） |
+| `POV_ROW_COLOR[3]` | `0x08000AA3` | 3 | 行→通道查表（板级实现） |
+
+#### LOOP 1 → LOOP 4 漂移表
+
+| 变量 | LOOP 1 | LOOP 4 | drift | 备注 |
+|------|--------|--------|-------|------|
+| `phase` | `0x20000000` | `0x20000008` | +8 | + SystemCoreClock(4) + s_font(4) |
+| `g_systick_ms` | `0x2000000C` | `0x2000000C` | 0 | g_spi_test_tx[3] 移除恰抵销 s_font(4) |
+| `g_isr_count_systick` | `0x20000010` | `0x20000010` | 0 | 同上 |
+| `g_isr_count_tim7` | `0x20000014` | `0x20000014` | 0 | 同上 |
+| `g_isr_count_exti3` | `0x20000018` | `0x20000018` | 0 | 同上 |
+| `g_LED_Show_RAM` | (无) | `0x2000001C` | NEW (24B) | LOOP 2 新增 |
+| `s_state` | `0x2000001C` | `0x20000034` | +24 | = + g_LED_Show_RAM(24) |
+| `s_cat` | `0x20000020` | `0x20000038` | +24 | 同上 |
+| `s_col` | (无) | `0x20000039` | NEW (1B) | LOOP 3 新增 |
+| `g_LED_key_down` | (无) | `0x2000003A` | NEW (1B) | LOOP 3 新增 |
+| `s_font` | (无) | `0x20000004` | NEW (4B .data) | LOOP 4 默认指向 FONT_LKM |
+| `s_pending` | `0x20000028` | `0x2000003C` | +20 | = +g_LED_Show_RAM(24) -g_spi_test_phase(4) |
+| `s_trigger_ms` | `0x2000002C` | `0x20000040` | +20 | 同上 |
+
+### 4.5 LOOP 4 字模数据形状（手绘 L/K/M）
+
+每个字模 = `uint8_t[POV_ROW_NUM=3][POV_COL_NUM=40]`，每字节 1 列 8 颗 LED 的位图
+（bit i = 该列第 i 颗 LED 是否点亮本行通道颜色）。
+
+| 字模 | 行 (颜色) | 字节 | 数据模式（手绘 ASCII） |
+|------|-----------|------|----------------------|
+| **L** (row 0 = 蓝) | cols 0..14 = `0xFF`, col 15 = `0x01`, cols 16..39 = `0x00` | 竖+底 | `█ █ █ █ █ █ █ █` |
+| **K** (row 1 = 绿) | cols 16..23 = `0xFF`, col 24 = `0x0F`, col 25 = `0x07`, col 26 = `0x03`, col 27 = `0x01`, col 28 = `0x80`, col 29 = `0xC0`, col 30 = `0xE0`, col 31 = `0xF0` | 竖+双斜 | `█ ╲ ╱<` |
+| **M** (row 2 = 红) | cols 32 = `0xFF`, col 33 = `0xC3`, col 34 = `0xE7`, col 35 = `0xFF`, col 36 = `0xFF`, col 37 = `0xE7`, col 38 = `0xC3`, col 39 = `0xFF` | 双竖+V | `█ ╱ ╲ ╱ ╲ █` |
+
+字体尺寸限制：M 仅 8 列（POV_COL_NUM=40, 留给 M 的只有 32..39 = 8 列），其他
+cols 在 M 行恒为 0x00。L/K 各占 16 列，余 8 列（M 占）也保持 0x00。
 
 ---
 

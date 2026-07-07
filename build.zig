@@ -59,4 +59,21 @@ pub fn build(b: *std.Build) void {
 
     // ── Install the firmware .elf ──
     b.installArtifact(exe);
+
+    // ── Host-native unit tests (golden output, FSM, debounce) ──
+    // Runs `zig build test` against src/control/mod.zig on the host arch.
+    // No FFI: the control layer is pure; the c_bridge test surface is
+    // intentionally excluded so this target needs zero cross-compilation.
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/control/mod.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_test = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run host-native unit tests");
+    test_step.dependOn(&run_test.step);
+
+    // `zig build` builds the firmware; `zig build test` runs the host tests.
 }
