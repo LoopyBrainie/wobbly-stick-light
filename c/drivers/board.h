@@ -68,22 +68,35 @@ extern "C" {
 #define POV_TIM                TIM7
 #define POV_TIM_IRQn           TIM7_IRQn     /* 来自 stm32f103xe.h: 55 */
 #define POV_TIM_PRESCALER      3599U         /* 72 MHz / 3600 = 20 kHz */
-#define POV_TIM_AUTORELOAD     4U            /* 20 kHz / 5 = 4 kHz → 250 us 周期 */
+#define POV_TIM_AUTORELOAD     4U            /* 20 kHz / 5 = 4 kHz → 250 us 周期（与 car2025 reference 对齐 + 冲程去抖）*/
 #define POV_TIM_TICK_HZ        4000U
 #define POV_TIM_TICK_US        250U
 
 /* === 显示帧几何常量（与 car2025_final 一致） === */
-#define POV_COL_NUM            48U           /* 一帧的列数 */
+#define POV_COL_NUM            40U           /* 一帧的列数 (Boundary C invariant) */
 #define POV_ROW_NUM            3U            /* 三行字模：蓝 / 绿 / 红 */
 #define POV_CAT_NUM            6U            /* 6 段扫描 cat 选择 */
 #define POV_INTERRUPTS_PER_FRAME (POV_COL_NUM * POV_CAT_NUM)   /* 240 中断/帧 */
 #define POV_FRAME_PERIOD_MS    ((uint32_t)(POV_INTERRUPTS_PER_FRAME * POV_TIM_TICK_US) / 1000U)  /* 60 ms */
 
-/* === 像素颜色编码（8 bits = 蓝2 + 绿3 + 红3） === */
-#define POV_COLOR_BLUE         0x80U         /* bit7 = 蓝亮（高 2 bit = 10） */
-#define POV_COLOR_GREEN        0x08U         /* bit3 = 绿亮（中 3 bit = 001） */
-#define POV_COLOR_RED          0x01U         /* bit0 = 红亮（低 3 bit = 001） */
-#define POV_COLOR_YELLOW       0x09U         /* 绿 + 红 */
+/* === 像素颜色编码（8 bits = 蓝2 + 绿3 + 红3） ===
+ * 关键：POV_COLOR_* 必须 **满通道**（B=3, G=7, R=7）才能在 LEDSHOW 中
+ * 让一个 cat 的 4 颗 LED 同时点亮。若只用 B=2 / G=1 / R=1（0x80 / 0x08 / 0x01）
+ * 只能让 1-2 颗/cat 亮——font byte=0xFF 的"垂直满列"看上去变成顶部 4 颗
+ * 稀疏点亮而非完整 8 颗垂直条，眼睛看到的"全亮"其实是稀疏高亮被融合。
+ *   例：POV_COLOR_BLUE=0xC0 → B=3 → cat 内 4 颗全蓝
+ *       POV_COLOR_GREEN=0x38 → G=7 → cat 内 4 颗全绿
+ *       POV_COLOR_RED=0x07 → R=7 → cat 内 4 颗全红
+ *       POV_COLOR_YELLOW=0x3F → G+R=满 → cat 内 4 颗全黄
+ * LEDSHOWN 中 buf/bit-domain 解码：
+ *   b = (byte >> 6) & 0x03  → 0=空 / 1=第0颗 / 2=第0,1颗 / 3=4颗全亮
+ *   g = (byte >> 3) & 0x07  → 同理 0..7 对应 0..4 颗
+ *   r =  byte        & 0x07  → 同理 0..7 对应 0..4 颗
+ */
+#define POV_COLOR_BLUE         0xC0U         /* B = 0x03 = 4 颗全亮 */
+#define POV_COLOR_GREEN        0x38U         /* G = 0x07 = 4 颗全亮 */
+#define POV_COLOR_RED          0x07U         /* R = 0x07 = 4 颗全亮 */
+#define POV_COLOR_YELLOW       0x3FU         /* G+R = 4 颗全亮 */
 #define POV_COLOR_OFF          0x00U
 
 #ifdef __cplusplus
