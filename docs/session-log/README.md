@@ -642,3 +642,104 @@ Symbol-based reads vs address-based reads：
 
 ---
 
+## 14. Session 4（2026-07-07 afternoon）：POV 字模设计迭代 + car2025 reference 重读
+
+> 关键失误：把 car2025 `g_ShowData[3][48]` **的 3 行错认为 3 帧**——实际 3 行 = 3 个 LED 行（顶/中/底），每行 48 col 扫同一组 col 时刻的不同 LED。整 session 围绕这个语义错位绕弯。
+>
+> 设计报告必引："以 reference 中间固定部分为参考"——reference **不在 ISR 内轮换 frame**，"交替"是更高层（car2025 菜单）切换 `g_ShowData` 索引；ISR 内每行 col 数据是**完全静态**的。
+
+### 14.1 真 bug 修复 #3：POV_COLOR 常量错位（"全亮" 现象根因）
+
+**症状**：用户观察 POV 图像"全亮"（糊成一团），L/K/M 字母不分明。
+
+**根因（bit-domain 错配）**：bit-domain 解码 `b=(byte>>6)&3, g=(byte>>3)&7, r=byte&7`。旧 `POV_COLOR_BLUE=0x80`：B = `(0x80>>6)&3 = 2` → **只点亮 cat 内 2/4 颗 LED**，不是全部 4 颗。字模 byte = 0xFF（意图"该列 8 颗全亮"）+ `POV_COLOR_BLUE=0x80` → 写入 8 个 RAM 位置全部 = 0x80 → 每 cat 只亮 2 颗 → 顶 8 LED 中只有 4 颗亮（positions 0,1,4,5）。用户看到 4 颗稀疏亮点，被 4 kHz ISR + 视觉融合成"亮带"，但字母形状消失。
+
+**修复**（`c/drivers/board.h`）：B/G/R 通道必须填满。`POV_COLOR_BLUE=0xC0` (B=3,4 颗/cat)、`POV_COLOR_GREEN=0x38` (G=7)、`POV_COLOR_RED=0x07` (R=7)、`POV_COLOR_YELLOW=0x3F` (G+R 满)。
+
+**易错点**：`0xFF`（全 RGB 通道最大）= **白**（4 颗混合色），不是任何单色。要纯蓝必须 `0xC0`。
+
+### 14.2 bit 顺序校正
+
+LED_Loop1 写 RAM 是 `for (i=0; i<8; i++) RAM[i]=(tmp&1)?color:0; tmp>>=1;`，所以 **bit 0 → RAM[0] → 顶部 LED**，bit 7 → 底部 LED（之前一直反着）。L 底横笔应写 `byte = 0x80`（仅 bit 7 = 底部 LED 亮），不是 `0x01`。
+
+### 14.3 car2025 reference 关键重读（纠正之前的误判）
+
+`car2025_final/Core/Src/led_show.c:16-38`：`g_ShowData[3][48]` = `[LED 行][col 扫描时刻]`。Row 0 = 顶 8 LEDs 蓝（含多段字母）、Row 1 = 中 8 LEDs 红（cols 20..26 固定菱形）、Row 2 = 底 8 LEDs 黄（多段字母）。`UserLEDShowProcess` 单调递增 col 0..40，每 6 cats 调 `LED_Loop1(col)` 把当前 col 的 3 行数据写入 24 个 RAM 位置。**ISR 内 g_ShowData 完全静态**，不存在 frame 切换。"上/下轮换字母"由更高层切换 `g_ShowData` 索引实现。
+
+**对本项目的指导**：3 行 = 3 个 LED 行；3 行 **共享同一组 col 扫描时刻**——col 维度水平扫描 + row 维度彩色分割。**每行在相同 col 段画一个字母**，字母在空间上**纵向堆叠**（L 顶/K 中/M 底），不滚动、不轮换。
+
+### 14.4 设计决策轨迹（用户改口语录）
+
+| 用户原话 | 校正 |
+|---------|------|
+| "我觉得可能每个字母 8 col 太少，需要更多宽度" | 12 col → 16 col |
+| "你可以看 reference 中间那个不变的部分来对齐" | "中间不变" 是 row 1 固定图案，但**不应模仿其 frame 切换**——只学其 col 宽度 + 速度 |
+| "我只是想借鉴 reference 心形的**宽度和速度**" | 抛弃"frame 切换"思路；只搬 **8 col 宽 + 60ms 帧 + 4 kHz ISR** 这三个数值 |
+| "我们本质还是**让三个字母纵向排列**，**不滚动显示**" | **3 字母同 col 段、上下堆叠**，不跨 col 段 |
+| "L 竖笔太粗了 / K 出现幻视 X / M 勉强辨认"（迭代 3 次） | L 竖 5→2 col；K 斜臂 1-LED 厚→2-LED 厚、加 4 col、加 2 col gap；M 加宽到 2 col 双竖 + 8 col V 谷 |
+| "K 整体再拉宽一点，可以通过斜笔画断开中间留点空像素" | K 5 col → 7 col，**斜笔画中间插 2 col 黑像素**形成"断笔" |
+
+### 14.5 最终字模设计（design report 重点引）
+
+```c
+// c/drivers/font_pov.c FONT_LKM[3][40]，每行有效段 cols 12..27 (16 col 宽)：
+// Row 0 蓝 L: 2 col 竖 + 14 col 底横
+{ ...,0xFF,0xFF,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,... }
+// Row 1 绿 K: 1 col 竖 + 2-LED 厚 2 段(中间 2 col 黑断开) + 角
+{ ...,0xFF,0x66,0x00,0x00,0x66,0xC3,0x81,0x00,... }
+// Row 2 红 M: 2 col 双竖 + 2 段 V 入 + 8 col V 谷 + 2 段 V 出
+{ ...,0xFF,0xFF,0x02,0x04,0x08,0x08,0x08,0x08,0x08,0x08,0x08,0x08,0x04,0x02,0xFF,0xFF,... }
+```
+
+### 14.6 时序参数（最终态）
+
+| 项 | 值 | 来源 |
+|----|-----|------|
+| TIM7 prescaler | 3599 | car2025 reference，对齐 |
+| TIM7 autoreload | 4 | car2025 reference |
+| TIM7 tick | 4 kHz = 250 µs/tick | 72 MHz / 3600 / 5 |
+| Cats per col | 6 | 24 LED / 4 LED per cat |
+| Col period | 1.5 ms = 6 × 250µs | 推导 |
+| Cols per frame | 40 | Boundary C 不变量 |
+| Frame period | 60 ms | 推导 |
+| Frame rate | 16.7 fps | 推导 |
+| 1 m/s 挥动时 1 col 物理宽 | 1.5 mm | V × Δt |
+| 1 m/s 挥动时 16 col 字母宽 | 24 mm | 推导 |
+
+### 14.7 用户反馈语录（design report 强引）
+
+- "reference 是在上面和下面轮流显示字母，中间是不轮换的图案" —— 误读了 reference 的"轮换"机制
+- "我只是让你借鉴显示心形的**宽度和速度**" —— 修正：只搬数字，不搬 frame 切换语义
+- "我们本质还是让三个字母**纵向排列**，**不滚动显示**" —— 3 字母同 col 段上下堆叠
+- "K 容易出现幻视 X 和全部粘成一竖" —— 1-LED 厚斜臂 → 幻视 X；cols 太少 → 粘连
+- "L 竖笔画太宽了" —— L 竖 5 col → 收窄到 2 col
+- "K 整体再拉宽一点，**可以通过斜笔画断开中间留点空像素**" —— K 7 col，斜笔画中间插 2 col 黑断笔
+
+### 14.8 POV_COLOR 满通道公式（design report 可直接引）
+
+```
+byte = (R<<0) | (G<<3) | (B<<6)
+  R =  byte        & 0x07  (3 bits → 0..4 LEDs/cat)
+  G = (byte >> 3)  & 0x07  (3 bits)
+  B = (byte >> 6)  & 0x03  (2 bits → 0..4 LEDs/cat)
+```
+
+每通道值 N 表示"cat 内第几个 LED 起开始亮"。POV_COLOR 必须 = max 通道值才能 byte=0xFF 整列 8 LED 满亮：
+- `POV_COLOR_BLUE = 0xC0` (B=3 → 8 LED 全蓝)
+- `POV_COLOR_GREEN = 0x38` (G=7)
+- `POV_COLOR_RED = 0x07` (R=7)
+- `POV_COLOR_YELLOW = 0x3F` (G+R=max)
+
+### 14.9 经验教训（设计报告可引）
+
+1. 用户/linter 回滚代码改动时，未必会一起回滚我追加的 session-log 内容；如果 git stash 处理链断裂（drop dangling commit），文档记录也会丢失
+2. 每次 stash 操作必须确认 dangling commit 是否需要保留，否则先用 `git fsck --no-reflogs` 查无可恢复内容再 drop
+3. 用户提到的"the revert"具体指什么文件，需要逐个确认——本 session 我错误地假设 font_pov.c/board.h/led_pov.c 的回滚隐含了 session-log README 的回滚
+
+### 14.10 还需要补的事
+
+- 相机抓拍验证（用户没硬件）
+- L 底横笔"延伸"视觉缺陷：当前 `0x80` 仅接 1-LED 厚度，可能需要改 `0x81`（底 + 顶 2 LED）让底横笔"可看见"
+
+---
+
